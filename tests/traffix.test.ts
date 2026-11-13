@@ -5,6 +5,13 @@ import request from 'supertest';
 import { resetDbForTests } from '../src/server/db/connection.js';
 import { createApp } from '../src/server/app.js';
 import { initSocketServer } from '../src/server/realtime/socket.js';
+import {
+  formatNavigationInstruction,
+  getNavigationPhrase,
+  haversineDistanceMeters,
+  minDistanceToRouteMeters,
+  parseVoiceSearchQuery,
+} from '../src/utils/voiceNavigation.js';
 
 describe('TRAFFIX Full-Stack API & Algorithms Acceptance Suite', () => {
   let app: ReturnType<typeof createApp>;
@@ -1051,5 +1058,287 @@ describe('TRAFFIX Full-Stack API & Algorithms Acceptance Suite', () => {
       globalThis.fetch = origFetch;
       delete process.env.TRAFFIX_TEST_FETCH;
     }
+  });
+
+  it('supports 5 Google Routes travel modes, traffic intervals, tolls, transit details, and refuses inventing car routes for unsupported modes', async () => {
+    const origFetch = globalThis.fetch;
+    process.env.TRAFFIX_TEST_FETCH = 'true';
+
+    // Encoded polyline from (15.853, 74.502) to (15.868, 74.518) (~5 points)
+    const samplePolyline = '_{~_BgtleM_@_@_@_@_@_@';
+
+    try {
+      // 1. DRIVE mode with speedReadingIntervals + tollInfo + alternative route
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.travelMode).toBe('DRIVE');
+        expect(body.routingPreference).toBe('TRAFFIC_AWARE');
+        expect(body.extraComputations).toEqual(['TRAFFIC_ON_POLYLINE', 'TOLLS']);
+        return new Response(
+          JSON.stringify({
+            routes: [
+              {
+                distanceMeters: 4200,
+                duration: '720s',
+                staticDuration: '480s',
+                description: 'NH48 Bypass Corridor',
+                polyline: { encodedPolyline: samplePolyline },
+                travelAdvisory: {
+                  speedReadingIntervals: [
+                    { startPolylinePointIndex: 0, endPolylinePointIndex: 2, speed: 'NORMAL' },
+                    { startPolylinePointIndex: 2, endPolylinePointIndex: 4, speed: 'TRAFFIC_JAM' },
+                  ],
+                  tollInfo: {
+                    estimatedPrice: [{ currencyCode: 'INR', units: '45', nanos: 0 }],
+                  },
+                },
+                legs: [
+                  {
+                    steps: [
+                      {
+                        distanceMeters: 1200,
+                        staticDuration: '120s',
+                        navigationInstruction: {
+                          instructions: 'Turn right onto Club Road',
+                          maneuver: 'TURN_RIGHT',
+                        },
+                        startLocation: { latLng: { latitude: 15.853, longitude: 74.502 } },
+                      },
+                    ],
+                  },
+                ],
+              },
+              {
+                distanceMeters: 4500,
+                duration: '540s',
+                staticDuration: '500s',
+                description: 'Khanapur Inner Road',
+                polyline: { encodedPolyline: samplePolyline },
+                travelAdvisory: {
+                  speedReadingIntervals: [
+                    { startPolylinePointIndex: 0, endPolylinePointIndex: 4, speed: 'NORMAL' },
+                  ],
+                },
+                legs: [{ steps: [] }],
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }) as any;
+
+      const driveRes = await request(app).get('/api/routes/alternatives').query({
+        originLat: 15.853,
+        originLng: 74.502,
+        destinationLat: 15.868,
+        destinationLng: 74.518,
+        travelMode: 'DRIVE',
+      });
+      expect(driveRes.status).toBe(200);
+      expect(driveRes.body.data.travelMode).toBe('DRIVE');
+      expect(driveRes.body.data.liveTrafficAvailable).toBe(true);
+      expect(driveRes.body.data.alternatives.length).toBeGreaterThanOrEqual(2);
+      const firstDriveRoute = driveRes.body.data.alternatives.find(
+        (r: any) => r.tollInfo?.estimatedPriceText === '₹45'
+      );
+      expect(firstDriveRoute).toBeTruthy();
+      expect(firstDriveRoute.speedReadingIntervals.length).toBe(2);
+
+      // 2. TRANSIT mode returns transitSteps and omits routingPreference
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.travelMode).toBe('TRANSIT');
+        expect(body.routingPreference).toBeUndefined();
+        return new Response(
+          JSON.stringify({
+            routes: [
+              {
+                distanceMeters: 3100,
+                duration: '900s',
+                staticDuration: '900s',
+                polyline: { encodedPolyline: samplePolyline },
+                legs: [
+                  {
+                    steps: [
+                      {
+                        distanceMeters: 3100,
+                        staticDuration: '900s',
+                        startLocation: { latLng: { latitude: 15.854, longitude: 74.503 } },
+                        transitDetails: {
+                          transitLine: {
+                            name: 'NWKRTC Circular 101',
+                            nameShort: '101',
+                            vehicle: { type: 'BUS', name: { text: 'Bus' } },
+                          },
+                          headsign: 'CBT Terminus',
+                          stopCount: 5,
+                          stopDetails: {
+                            departureStop: { name: 'Chennamma Circle' },
+                            arrivalStop: { name: 'Central Bus Terminus' },
+                          },
+                        },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }) as any;
+
+      const transitRes = await request(app).get('/api/routes/alternatives').query({
+        originLat: 15.854,
+        originLng: 74.503,
+        destinationLat: 15.869,
+        destinationLng: 74.519,
+        travelMode: 'TRANSIT',
+      });
+      expect(transitRes.status).toBe(200);
+      expect(transitRes.body.data.travelMode).toBe('TRANSIT');
+      expect(transitRes.body.data.alternatives[0].transitSteps.length).toBe(1);
+      expect(transitRes.body.data.alternatives[0].transitSteps[0].shortName).toBe('101');
+
+      // 3. WALK mode includes Beta notice
+      globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body || '{}'));
+        expect(body.travelMode).toBe('WALK');
+        return new Response(
+          JSON.stringify({
+            routes: [
+              {
+                distanceMeters: 1200,
+                duration: '840s',
+                staticDuration: '840s',
+                polyline: { encodedPolyline: samplePolyline },
+                legs: [{ steps: [] }],
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }) as any;
+
+      const walkRes = await request(app).get('/api/routes/alternatives').query({
+        originLat: 15.855,
+        originLng: 74.504,
+        destinationLat: 15.861,
+        destinationLng: 74.509,
+        travelMode: 'WALK',
+      });
+      expect(walkRes.status).toBe(200);
+      expect(walkRes.body.data.alternatives[0].betaWarning).toMatch(/Beta/i);
+
+      // 4. Unsupported TRANSIT or BICYCLE route returns 422 instead of inventing a car route
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ routes: [] }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as any;
+
+      const unsupportedTransit = await request(app).get('/api/routes/alternatives').query({
+        originLat: 15.901,
+        originLng: 74.601,
+        destinationLat: 15.951,
+        destinationLng: 74.651,
+        travelMode: 'TRANSIT',
+      });
+      expect(unsupportedTransit.status).toBe(422);
+      expect(unsupportedTransit.body.success).toBe(false);
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env.TRAFFIX_TEST_FETCH;
+    }
+  });
+
+  it('serves Google Places nearby search for navigation chips and merges TRAFFIX sample parking/bus facilities cleanly', async () => {
+    // 1. Offline: gas_station returns UNAVAILABLE with empty list, parking returns TRAFFIX_SAMPLE only
+    const offlineGas = await request(app)
+      .get('/api/routes/nearby-places')
+      .query({ lat: 15.853, lng: 74.502, category: 'gas_station' });
+    expect(offlineGas.status).toBe(200);
+    expect(offlineGas.body.data.source).toBe('UNAVAILABLE');
+    expect(offlineGas.body.data.places).toEqual([]);
+
+    const offlineParking = await request(app)
+      .get('/api/routes/nearby-places')
+      .query({ lat: 15.853, lng: 74.502, category: 'parking', radius: 10000 });
+    expect(offlineParking.status).toBe(200);
+    expect(offlineParking.body.data.places.length).toBeGreaterThan(0);
+    expect(offlineParking.body.data.places.every((p: any) => p.source === 'TRAFFIX_SAMPLE')).toBe(
+      true
+    );
+
+    // 2. Online Google Places New mock for gas_station
+    const origFetch = globalThis.fetch;
+    process.env.TRAFFIX_TEST_FETCH = 'true';
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          places: [
+            {
+              id: 'ChIJ_fuel_1',
+              displayName: { text: 'IndianOil Fuel Station' },
+              formattedAddress: 'Club Road, Belagavi',
+              location: { latitude: 15.8545, longitude: 74.5035 },
+              currentOpeningHours: { openNow: true },
+              rating: 4.3,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )) as any;
+
+    try {
+      const onlineGas = await request(app)
+        .get('/api/routes/nearby-places')
+        .query({ lat: 15.853, lng: 74.502, category: 'gas_station' });
+      expect(onlineGas.status).toBe(200);
+      expect(onlineGas.body.data.source).toBe('GOOGLE_PLACES_NEW');
+      expect(onlineGas.body.data.places[0].name).toBe('IndianOil Fuel Station');
+    } finally {
+      globalThis.fetch = origFetch;
+      delete process.env.TRAFFIX_TEST_FETCH;
+    }
+  });
+
+  it('parses voice search queries and builds localized turn-by-turn phrases in 5 languages', () => {
+    expect(parseVoiceSearchQuery('Take me to Mysore Palace')).toEqual({
+      rawTranscript: 'Take me to Mysore Palace',
+      cleanQuery: 'Mysore Palace',
+      nearbyCategory: null,
+    });
+    expect(parseVoiceSearchQuery('Find the nearest petrol pump')).toEqual({
+      rawTranscript: 'Find the nearest petrol pump',
+      cleanQuery: 'petrol pump',
+      nearbyCategory: 'gas_station',
+    });
+    expect(parseVoiceSearchQuery('nearest hospital')).toEqual({
+      rawTranscript: 'nearest hospital',
+      cleanQuery: 'nearest hospital',
+      nearbyCategory: 'hospital',
+    });
+
+    const languages = ['en', 'hi', 'kn', 'te', 'ta'] as const;
+    for (const lang of languages) {
+      const text = formatNavigationInstruction(
+        'Turn right onto MG Road',
+        300,
+        lang,
+        'TURN_RIGHT'
+      );
+      expect(text.length).toBeGreaterThan(5);
+      expect(getNavigationPhrase('reroute', lang).length).toBeGreaterThan(3);
+      expect(getNavigationPhrase('arrived', lang).length).toBeGreaterThan(3);
+    }
+
+    const d = haversineDistanceMeters(15.853, 74.502, 15.853, 74.502);
+    expect(d).toBe(0);
+    const offRouteDist = minDistanceToRouteMeters(15.86, 74.51, [
+      [15.85, 74.5],
+      [15.85, 74.52],
+    ]);
+    expect(offRouteDist).toBeGreaterThan(1000);
   });
 });

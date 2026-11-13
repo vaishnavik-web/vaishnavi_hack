@@ -30,6 +30,8 @@ export const profileUpdateSchema = z.object({
   name: z.string().trim().min(2).max(80),
 });
 
+export const travelModeEnum = z.enum(['DRIVE', 'TWO_WHEELER', 'BICYCLE', 'WALK', 'TRANSIT']);
+
 export const routeAlternativesQuerySchema = z
   .object({
     originNodeId: z.string().trim().min(1).optional(),
@@ -40,6 +42,7 @@ export const routeAlternativesQuerySchema = z
     destinationLat: z.coerce.number().min(-90).max(90).optional(),
     destinationLng: z.coerce.number().min(-180).max(180).optional(),
     destinationLabel: z.string().trim().max(160).optional(),
+    travelMode: travelModeEnum.optional().default('DRIVE'),
     distanceWeight: z.coerce.number().min(0).max(1).optional(),
     timeWeight: z.coerce.number().min(0).max(1).optional(),
     congestionWeight: z.coerce.number().min(0).max(1).optional(),
@@ -67,6 +70,7 @@ export const evaluateRoutesBodySchema = z.object({
   destinationLng: z.number().min(-180).max(180),
   destinationLabel: z.string().trim().max(160).optional(),
   destinationNodeId: z.string().trim().min(1).optional(),
+  travelMode: travelModeEnum.optional().default('DRIVE'),
   distanceWeight: z.number().min(0).max(1).optional(),
   timeWeight: z.number().min(0).max(1).optional(),
   congestionWeight: z.number().min(0).max(1).optional(),
@@ -76,6 +80,7 @@ export const evaluateRoutesBodySchema = z.object({
       z.object({
         distanceMeters: z.number().nonnegative(),
         durationSeconds: z.number().nonnegative(),
+        staticDurationSeconds: z.number().nonnegative().optional(),
         geometry: z.array(z.tuple([z.number(), z.number()])).min(2),
         summary: z.string().max(200).optional(),
         steps: z
@@ -83,6 +88,7 @@ export const evaluateRoutesBodySchema = z.object({
             z.object({
               instruction: z.string(),
               name: z.string().optional(),
+              maneuver: z.string().optional(),
               distanceMeters: z.number().nonnegative().optional(),
               durationSec: z.number().nonnegative().optional(),
               latitude: z.number(),
@@ -95,6 +101,13 @@ export const evaluateRoutesBodySchema = z.object({
     )
     .min(1)
     .max(5),
+});
+
+export const nearbyPlacesQuerySchema = z.object({
+  lat: z.coerce.number().min(-90).max(90),
+  lng: z.coerce.number().min(-180).max(180),
+  category: z.enum(['gas_station', 'hospital', 'parking', 'restaurant', 'bus_station', 'atm']),
+  radius: z.coerce.number().int().min(500).max(25000).optional().default(5000),
 });
 
 export const reverseGeocodeQuerySchema = z.object({

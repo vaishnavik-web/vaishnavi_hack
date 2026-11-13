@@ -153,15 +153,78 @@ export interface GeocodeSuggestionDTO {
   zone?: string;
 }
 
+export type TravelMode = 'DRIVE' | 'TWO_WHEELER' | 'BICYCLE' | 'WALK' | 'TRANSIT';
+
+export type TrafficSpeedLevel = 'SPEED_UNSPECIFIED' | 'NORMAL' | 'SLOW' | 'TRAFFIC_JAM';
+
+export interface TrafficSpeedIntervalDTO {
+  startPolylinePointIndex: number;
+  endPolylinePointIndex: number;
+  speed: TrafficSpeedLevel;
+}
+
+export interface TollInfoDTO {
+  estimatedPriceText: string;
+  currencyCode: string;
+  amount: number;
+}
+
+export interface TransitStepSummaryDTO {
+  lineName: string;
+  shortName?: string;
+  vehicleType?: string;
+  headsign?: string;
+  departureStop?: string;
+  arrivalStop?: string;
+  departureTimeText?: string;
+  arrivalTimeText?: string;
+  numStops?: number;
+}
+
+export type NearbyPlaceCategory =
+  | 'gas_station'
+  | 'hospital'
+  | 'parking'
+  | 'restaurant'
+  | 'bus_station'
+  | 'atm';
+
+export interface NearbyPlaceDTO {
+  placeId: string;
+  category: NearbyPlaceCategory;
+  name: string;
+  address: string;
+  latitude: number;
+  longitude: number;
+  distanceMeters: number;
+  openNow: boolean | null;
+  rating: number | null;
+  source: 'GOOGLE_PLACES_NEW' | 'TRAFFIX_SAMPLE';
+  priceLabel?: string;
+}
+
+export interface NearbyPlacesResponseDTO {
+  places: NearbyPlaceDTO[];
+  source: 'GOOGLE_PLACES_NEW' | 'MIXED' | 'UNAVAILABLE';
+  quotaExceeded: boolean;
+  notice: string;
+  searchedAt: string;
+}
+
 export interface RouteAlternativeDTO {
   category: RouteCategory;
   routeName?: string;
+  travelMode?: TravelMode;
   algorithm:
     | 'DIJKSTRA_SHORTEST'
     | 'DIJKSTRA_FASTEST'
     | 'ASTAR_MULTIFACTOR'
     | 'GOOGLE_ROUTES_DRIVING'
     | 'GOOGLE_ROUTES_ALTERNATIVE'
+    | 'GOOGLE_ROUTES_TWO_WHEELER'
+    | 'GOOGLE_ROUTES_BICYCLE'
+    | 'GOOGLE_ROUTES_WALK'
+    | 'GOOGLE_ROUTES_TRANSIT'
     | 'OSRM_DRIVING'
     | 'OSRM_ALTERNATIVE';
   pathNodeIds: string[];
@@ -169,8 +232,15 @@ export interface RouteAlternativeDTO {
   geometry: Array<[number, number]>;
   totalDistanceKm: number;
   estimatedTimeMin: number;
+  staticDurationMin?: number;
   avgCongestion: number;
   trafficLevel?: CongestionClass;
+  liveTrafficAvailable?: boolean;
+  trafficSummary?: string;
+  speedReadingIntervals?: TrafficSpeedIntervalDTO[];
+  tollInfo?: TollInfoDTO | null;
+  transitSteps?: TransitStepSummaryDTO[];
+  betaWarning?: string | null;
   incidentCount?: number;
   closureWarnings?: string[];
   intersectsClosedRoad?: boolean;
@@ -184,6 +254,7 @@ export interface RouteAlternativeDTO {
     latitude: number;
     longitude: number;
     distanceMeters?: number;
+    maneuver?: string;
   }>;
   relevantIncidents: Array<{
     id: string;
@@ -213,6 +284,10 @@ export interface RouteAlternativeDTO {
 export interface RouteAlternativesResultDTO {
   origin: RoadNodeDTO & { label?: string; source?: string };
   destination: RoadNodeDTO & { label?: string; source?: string };
+  travelMode?: TravelMode;
+  liveTrafficAvailable?: boolean;
+  trafficSummary?: string;
+  lastUpdated?: string;
   alternatives: RouteAlternativeDTO[];
   recalculatedDueToNetworkEvent: boolean;
   activeClosuresCount: number;
@@ -831,3 +906,46 @@ export interface NearbyHospitalsResponseDTO {
   notice: string;
   searchedAt: string;
 }
+
+export interface OfflineRegionBounds {
+  north: number;
+  south: number;
+  east: number;
+  west: number;
+}
+
+export interface OfflineRegionPresetDTO {
+  id: string;
+  name: string;
+  subtitle: string;
+  bounds: OfflineRegionBounds;
+  center: { lat: number; lng: number };
+  minZoom: number;
+  maxZoom: number;
+  estimatedTiles: number;
+  estimatedSizeKb: number;
+}
+
+export interface OfflinePrecomputedRouteDTO {
+  cacheKey: string;
+  originLabel: string;
+  destinationLabel: string;
+  originLat: number;
+  originLng: number;
+  destinationLat: number;
+  destinationLng: number;
+  travelMode: TravelMode;
+  result: RouteAlternativesResultDTO;
+}
+
+export interface OfflineRegionBundleDTO {
+  region: OfflineRegionPresetDTO;
+  nodes: RoadNodeDTO[];
+  segments: RoadSegmentDTO[];
+  parkingLocations: ParkingLocationDTO[];
+  busStops: BusStopDTO[];
+  precomputedRoutes: OfflinePrecomputedRouteDTO[];
+  downloadedAt: string;
+  expiresAt: string;
+}
+

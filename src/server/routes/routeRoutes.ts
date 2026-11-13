@@ -11,11 +11,13 @@ import {
   listSavedRoutes,
   reverseGeocodeQuery,
   saveUserRoute,
+  searchNearbyNavigationPlaces,
 } from '../services/routeService.js';
 import { sendSuccess } from '../utils/response.js';
 import {
   evaluateRoutesBodySchema,
   idParamSchema,
+  nearbyPlacesQuerySchema,
   reverseGeocodeQuerySchema,
   routeAlternativesQuerySchema,
   saveRouteSchema,
@@ -50,6 +52,20 @@ router.get(
       const { lat, lng } = res.locals.validatedQuery;
       const data = await reverseGeocodeQuery(getDb(), lat, lng);
       return sendSuccess(res, data, 'Reverse geocoding completed');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get(
+  '/nearby-places',
+  validateQuery(nearbyPlacesQuerySchema),
+  async (_req, res, next) => {
+    try {
+      const { lat, lng, category, radius } = res.locals.validatedQuery;
+      const data = await searchNearbyNavigationPlaces(getDb(), lat, lng, category, radius);
+      return sendSuccess(res, data, 'Nearby places lookup completed');
     } catch (err) {
       next(err);
     }

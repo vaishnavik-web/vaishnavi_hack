@@ -1,7 +1,10 @@
 import dotenv from 'dotenv';
 import path from 'path';
 
-dotenv.config();
+dotenv.config({
+  override: process.env.NODE_ENV !== 'production' && process.env.VITEST !== 'true',
+  quiet: true,
+});
 
 export const env = {
   port: Number(process.env.PORT || 3000),

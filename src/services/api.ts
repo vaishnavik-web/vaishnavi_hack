@@ -24,7 +24,11 @@ import {
   IncidentStatus,
   JunctionDTO,
   NearbyHospitalsResponseDTO,
+  NearbyPlaceCategory,
+  NearbyPlacesResponseDTO,
   NetworkImpactResultDTO,
+  OfflineRegionBundleDTO,
+  OfflineRegionPresetDTO,
   ParkingLocationDTO,
   ParkingReservationDTO,
   ParkingSlotItemDTO,
@@ -37,6 +41,7 @@ import {
   SimulationScenarioDTO,
   TrafficPredictionDTO,
   TransitJourneyOptionDTO,
+  TravelMode,
   UserDTO,
 } from '../shared/types';
 import { apiClient } from './apiClient';
@@ -100,6 +105,18 @@ export const routesApi = {
     });
     return res.data.data;
   },
+  async getNearbyPlaces(
+    lat: number,
+    lng: number,
+    category: NearbyPlaceCategory,
+    radius = 5000
+  ): Promise<NearbyPlacesResponseDTO> {
+    const res = await apiClient.get<ApiResponse<NearbyPlacesResponseDTO>>(
+      '/routes/nearby-places',
+      { params: { lat, lng, category, radius } }
+    );
+    return res.data.data;
+  },
   async getAlternatives(params: {
     originNodeId?: string;
     destinationNodeId?: string;
@@ -109,6 +126,7 @@ export const routesApi = {
     destinationLat?: number;
     destinationLng?: number;
     destinationLabel?: string;
+    travelMode?: TravelMode;
     distanceWeight?: number;
     timeWeight?: number;
     congestionWeight?: number;
@@ -129,6 +147,7 @@ export const routesApi = {
     destinationLng: number;
     destinationLabel?: string;
     destinationNodeId?: string;
+    travelMode?: TravelMode;
     distanceWeight?: number;
     timeWeight?: number;
     congestionWeight?: number;
@@ -136,11 +155,13 @@ export const routesApi = {
     candidates: Array<{
       distanceMeters: number;
       durationSeconds: number;
+      staticDurationSeconds?: number;
       geometry: Array<[number, number]>;
       summary?: string;
       steps?: Array<{
         instruction: string;
         name?: string;
+        maneuver?: string;
         distanceMeters?: number;
         durationSec?: number;
         latitude: number;
@@ -761,4 +782,34 @@ export const sosApi = {
     return res.data.data.log;
   },
 };
+
+export const offlineApi = {
+  async listRegions(): Promise<OfflineRegionPresetDTO[]> {
+    const res = await apiClient.get<ApiResponse<{ regions: OfflineRegionPresetDTO[] }>>(
+      '/offline/regions'
+    );
+    return res.data.data.regions;
+  },
+  async getRegionBundle(regionId: string): Promise<OfflineRegionBundleDTO> {
+    const res = await apiClient.get<ApiResponse<OfflineRegionBundleDTO>>(
+      `/offline/regions/${encodeURIComponent(regionId)}/bundle`
+    );
+    return res.data.data;
+  },
+  async getCustomBundle(params: {
+    name: string;
+    north: number;
+    south: number;
+    east: number;
+    west: number;
+    minZoom?: number;
+    maxZoom?: number;
+  }): Promise<OfflineRegionBundleDTO> {
+    const res = await apiClient.get<ApiResponse<OfflineRegionBundleDTO>>('/offline/custom-bundle', {
+      params,
+    });
+    return res.data.data;
+  },
+};
+
 

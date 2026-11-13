@@ -10,6 +10,7 @@ import authRoutes from './routes/authRoutes.js';
 import docsRoutes from './routes/docsRoutes.js';
 import emergencyRoutes from './routes/emergencyRoutes.js';
 import incidentRoutes from './routes/incidentRoutes.js';
+import offlineRoutes from './routes/offlineRoutes.js';
 import parkingRoutes from './routes/parkingRoutes.js';
 import predictionRoutes from './routes/predictionRoutes.js';
 import routeRoutes from './routes/routeRoutes.js';
@@ -54,6 +55,7 @@ export function createApp() {
   app.use('/api/emergency', emergencyRoutes);
   app.use('/api/sos', sosRoutes);
   app.use('/api/analytics', analyticsRoutes);
+  app.use('/api/offline', offlineRoutes);
 
   // Unknown API routes return structured JSON 404
   app.use('/api', (_req, res) => {

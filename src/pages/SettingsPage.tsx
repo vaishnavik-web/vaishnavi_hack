@@ -1,7 +1,8 @@
 import React from 'react';
 import { Link } from 'react-router-dom';
-import { Check, Moon, Shield, Sun, User } from 'lucide-react';
+import { Check, HardDrive, Moon, Shield, Sun, User } from 'lucide-react';
 import { WorkspaceLayout } from '../components/Layout';
+import { OfflineMapsManager } from '../components/OfflineMapsManager';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 
@@ -150,6 +151,20 @@ export function SettingsPage() {
               <strong>Scheduled Sample Bus Timetables</strong>.
             </p>
           </div>
+        </section>
+
+        {/* Offline Region Maps & Route Cache */}
+        <section className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0D1424] p-6 space-y-4 shadow-sm">
+          <div>
+            <h2 className="text-base font-semibold text-slate-900 dark:text-white flex items-center gap-2">
+              <HardDrive className="w-4 h-4 text-blue-500" />
+              Offline Region Maps &amp; Route Cache (IndexedDB)
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+              Download regional vector map tiles, road graphs, parking spots, bus stops, and precomputed routes into IndexedDB so navigation works even without stable internet connectivity.
+            </p>
+          </div>
+          <OfflineMapsManager />
         </section>
       </div>
     </WorkspaceLayout>

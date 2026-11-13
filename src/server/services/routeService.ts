@@ -2,12 +2,15 @@ import Database from 'better-sqlite3';
 import crypto from 'crypto';
 import {
   CongestionClass,
+  NearbyPlaceCategory,
   RoadNodeDTO,
   RoadSegmentDTO,
   RouteAlternativeDTO,
   RouteAlternativesResultDTO,
   RouteCategory,
   ScoreBreakdown,
+  TrafficSpeedIntervalDTO,
+  TravelMode,
 } from '../../shared/types.js';
 import { haversineMeters, pointToSegmentDistanceMeters } from '../algorithms/geo.js';
 import { buildEffectiveGraph, classifyCongestion, NetworkGraph } from '../algorithms/graph.js';
@@ -19,12 +22,23 @@ import {
 import {
   ExternalParsedRoute,
   fetchGoogleRoutes,
+  fetchNearbyPlaces,
   findNearestRoadNode,
   getRoutingProviderMetadata,
   reverseGeocodeCoords,
   searchLocations,
 } from '../providers/routingProvider.js';
 import { AppError, badRequest, notFound, unprocessable } from '../utils/errors.js';
+
+export async function searchNearbyNavigationPlaces(
+  db: Database.Database,
+  lat: number,
+  lng: number,
+  category: NearbyPlaceCategory,
+  radius = 5000
+) {
+  return fetchNearbyPlaces(db, lat, lng, category, radius);
+}
 
 export function getNetworkSnapshot(db: Database.Database): {
   nodes: RoadNodeDTO[];
@@ -200,12 +214,96 @@ function minDistanceToSegment(pts: Array<[number, number]>, seg: RoadSegmentDTO)
   return minD;
 }
 
+function getBetaWarning(travelMode: TravelMode): string | null {
+  if (travelMode === 'WALK') {
+    return 'Beta walking route: sidewalks and pedestrian crossings may vary locally.';
+  }
+  if (travelMode === 'BICYCLE') {
+    return 'Beta cycling route: dedicated bike lanes and surface paths may vary locally.';
+  }
+  if (travelMode === 'TWO_WHEELER') {
+    return 'Beta two-wheeler route: local restrictions on flyovers or lanes may apply.';
+  }
+  return null;
+}
+
+function summarizeLiveTraffic(
+  intervals: TrafficSpeedIntervalDTO[],
+  durationSeconds: number,
+  staticDurationSeconds?: number
+): { trafficLevel: CongestionClass; summary: string; avgRatio: number } {
+  let totalSpan = 0;
+  let jamSpan = 0;
+  let slowSpan = 0;
+
+  for (const iv of intervals) {
+    const span = Math.max(1, iv.endPolylinePointIndex - iv.startPolylinePointIndex);
+    totalSpan += span;
+    if (iv.speed === 'TRAFFIC_JAM') jamSpan += span;
+    else if (iv.speed === 'SLOW') slowSpan += span;
+  }
+
+  const jamShare = totalSpan > 0 ? jamSpan / totalSpan : 0;
+  const slowShare = totalSpan > 0 ? slowSpan / totalSpan : 0;
+  const delayRatio =
+    staticDurationSeconds && staticDurationSeconds > 0
+      ? (durationSeconds - staticDurationSeconds) / staticDurationSeconds
+      : 0;
+
+  if (jamShare >= 0.14 || delayRatio >= 0.35) {
+    return {
+      trafficLevel: 'SEVERE',
+      summary: 'Heavy traffic detected on your route.',
+      avgRatio: Math.min(0.95, Math.max(0.75, 0.5 + jamShare + delayRatio * 0.5)),
+    };
+  }
+  if (jamShare >= 0.05 || slowShare >= 0.25 || delayRatio >= 0.16) {
+    return {
+      trafficLevel: 'HIGH',
+      summary: 'Moderate traffic ahead.',
+      avgRatio: Math.min(0.74, Math.max(0.55, 0.35 + slowShare * 0.5 + jamShare)),
+    };
+  }
+  if (slowShare >= 0.08 || delayRatio >= 0.06) {
+    return {
+      trafficLevel: 'MODERATE',
+      summary: 'Moderate traffic ahead.',
+      avgRatio: 0.42,
+    };
+  }
+  return {
+    trafficLevel: 'CLEAR',
+    summary: 'Traffic is moving smoothly.',
+    avgRatio: 0.18,
+  };
+}
+
+function getAlgorithmForMode(
+  travelMode: TravelMode,
+  isPrimary: boolean
+): RouteAlternativeDTO['algorithm'] {
+  if (!isPrimary && travelMode === 'DRIVE') return 'GOOGLE_ROUTES_ALTERNATIVE';
+  switch (travelMode) {
+    case 'TWO_WHEELER':
+      return 'GOOGLE_ROUTES_TWO_WHEELER';
+    case 'BICYCLE':
+      return 'GOOGLE_ROUTES_BICYCLE';
+    case 'WALK':
+      return 'GOOGLE_ROUTES_WALK';
+    case 'TRANSIT':
+      return 'GOOGLE_ROUTES_TRANSIT';
+    default:
+      return isPrimary ? 'GOOGLE_ROUTES_DRIVING' : 'GOOGLE_ROUTES_ALTERNATIVE';
+  }
+}
+
 function evaluateExternalRouteAgainstGraph(
   route: ExternalParsedRoute,
   graph: NetworkGraph,
   db: Database.Database,
   weights: MultiFactorWeights,
-  algorithm: 'GOOGLE_ROUTES_DRIVING' | 'GOOGLE_ROUTES_ALTERNATIVE'
+  algorithm: RouteAlternativeDTO['algorithm'],
+  travelMode: TravelMode = 'DRIVE'
 ): Omit<RouteAlternativeDTO, 'category' | 'routeName' | 'isRecommended'> {
   const sampledPts = sampleGeometryPoints(route.geometry, 70);
   const matchedSegments: RoadSegmentDTO[] = [];
@@ -278,9 +376,12 @@ function evaluateExternalRouteAgainstGraph(
   }
 
   const relevantIncidents = Array.from(relevantIncidentsMap.values());
+  const isMotorized = travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER';
+  const intervals = route.speedReadingIntervals || [];
+  const hasGoogleLiveTraffic =
+    isMotorized && (intervals.length > 0 || route.staticDurationSeconds !== undefined);
 
-  // Simulated traffic density: average across matched local segments or deterministic baseline
-  const avgCongestion =
+  const simCongestion =
     matchedSegments.length > 0
       ? Number(
           (
@@ -290,28 +391,64 @@ function evaluateExternalRouteAgainstGraph(
         )
       : 0.24;
 
-  const trafficLevel = classifyCongestion(avgCongestion);
+  let avgCongestion = simCongestion;
+  let trafficLevel: CongestionClass = classifyCongestion(avgCongestion);
+  let trafficSummary = 'Live traffic unavailable — using estimated travel time.';
+
+  if (hasGoogleLiveTraffic) {
+    const liveEval = summarizeLiveTraffic(
+      intervals,
+      route.durationSeconds,
+      route.staticDurationSeconds
+    );
+    avgCongestion = Number(liveEval.avgRatio.toFixed(2));
+    trafficLevel = liveEval.trafficLevel;
+    trafficSummary = liveEval.summary;
+  } else if (!isMotorized) {
+    avgCongestion = 0;
+    trafficLevel = 'CLEAR';
+    const modeLabel =
+      travelMode === 'WALK'
+        ? 'walking'
+        : travelMode === 'BICYCLE'
+        ? 'cycling'
+        : 'public transport';
+    trafficSummary = `Estimated ${modeLabel} travel time`;
+  }
+
   const totalDistanceKm = Number((route.distanceMeters / 1000).toFixed(2));
+  const staticDurationMin =
+    route.staticDurationSeconds !== undefined
+      ? Number(Math.max(0.5, route.staticDurationSeconds / 60).toFixed(1))
+      : undefined;
 
-  const congestionTimeMultiplier = 1 + Math.max(0, avgCongestion - 0.2) * 0.55;
-  const incidentDelayMin = relevantIncidents.reduce((sum, inc) => {
-    if (inc.severity === 'CRITICAL') return sum + 6;
-    if (inc.severity === 'HIGH') return sum + 4;
-    if (inc.severity === 'MEDIUM') return sum + 2;
-    return sum + 1;
-  }, 0);
-  const baseMin = route.durationSeconds / 60;
-  const estimatedTimeMin = Number(
-    Math.max(0.5, baseMin * congestionTimeMultiplier + incidentDelayMin).toFixed(1)
-  );
+  let estimatedTimeMin: number;
+  if (hasGoogleLiveTraffic || !isMotorized) {
+    estimatedTimeMin = Number(Math.max(0.5, route.durationSeconds / 60).toFixed(1));
+  } else {
+    const congestionTimeMultiplier = 1 + Math.max(0, avgCongestion - 0.2) * 0.55;
+    const incidentDelayMin = relevantIncidents.reduce((sum, inc) => {
+      if (inc.severity === 'CRITICAL') return sum + 6;
+      if (inc.severity === 'HIGH') return sum + 4;
+      if (inc.severity === 'MEDIUM') return sum + 2;
+      return sum + 1;
+    }, 0);
+    const baseMin = route.durationSeconds / 60;
+    estimatedTimeMin = Number(
+      Math.max(0.5, baseMin * congestionTimeMultiplier + incidentDelayMin).toFixed(1)
+    );
+  }
 
-  const congestionFuelFactor = 1 + avgCongestion * 0.55;
-  const estimatedFuelLiters = Number((totalDistanceKm * 0.085 * congestionFuelFactor).toFixed(2));
+  const fuelRate =
+    travelMode === 'DRIVE' ? 0.085 : travelMode === 'TWO_WHEELER' ? 0.032 : 0;
+  const congestionFuelFactor = 1 + avgCongestion * 0.45;
+  const estimatedFuelLiters = Number((totalDistanceKm * fuelRate * congestionFuelFactor).toFixed(2));
+
   const reliabilityScore = Number(
     Math.max(
       0.1,
       1.0 -
-        avgCongestion * 0.45 -
+        avgCongestion * 0.4 -
         Math.min(0.45, relevantIncidents.length * 0.18) -
         (intersectsClosedRoad ? 0.5 : 0)
     ).toFixed(2)
@@ -358,6 +495,7 @@ function evaluateExternalRouteAgainstGraph(
   const importantTurns = route.steps.map((st, idx) => ({
     nodeId: `step-${idx}`,
     nodeName: st.name || `Step ${idx + 1}`,
+    maneuver: st.maneuver || st.name || 'STRAIGHT',
     instruction:
       st.distanceMeters > 0
         ? `${st.instruction} (${
@@ -372,25 +510,37 @@ function evaluateExternalRouteAgainstGraph(
   }));
 
   const explanationParts = [
-    `${totalDistanceKm} km via ${route.summary || 'Google Maps road geometry'}`,
-    `${estimatedTimeMin} min ETA (${trafficLevel.toLowerCase()} simulated traffic, ${Math.round(
-      avgCongestion * 100
-    )}% load)`,
-    `${relevantIncidents.length} active incident(s)`,
+    `${totalDistanceKm} km via ${route.summary || 'Google Maps route'}`,
+    `${estimatedTimeMin} min ETA`,
+    trafficSummary,
   ];
+  if (route.tollInfo) {
+    explanationParts.push(`Est. toll ${route.tollInfo.estimatedPriceText}`);
+  }
+  if (relevantIncidents.length > 0) {
+    explanationParts.push(`${relevantIncidents.length} verified report(s) nearby`);
+  }
   if (intersectsClosedRoad) {
     explanationParts.push('WARNING: Crosses locally closed road segment');
   }
 
   return {
+    travelMode,
     algorithm,
     pathNodeIds: [],
     pathSegmentIds: matchedSegments.map((s) => s.id),
     geometry: route.geometry,
     totalDistanceKm,
     estimatedTimeMin,
+    staticDurationMin,
     avgCongestion,
     trafficLevel,
+    liveTrafficAvailable: hasGoogleLiveTraffic,
+    trafficSummary,
+    speedReadingIntervals: intervals,
+    tollInfo: route.tollInfo ?? null,
+    transitSteps: route.transitSteps ?? [],
+    betaWarning: getBetaWarning(travelMode),
     incidentCount: relevantIncidents.length,
     closureWarnings,
     intersectsClosedRoad,
@@ -463,6 +613,38 @@ function rankEvaluatedAlternatives(
   return categorized;
 }
 
+function buildTopLevelTrafficSummary(
+  alternatives: RouteAlternativeDTO[],
+  travelMode: TravelMode
+): { liveTrafficAvailable: boolean; trafficSummary: string } {
+  const primary = alternatives[0];
+  if (!primary) {
+    return {
+      liveTrafficAvailable: false,
+      trafficSummary: 'Live traffic unavailable — using estimated travel time.',
+    };
+  }
+  const liveTrafficAvailable = Boolean(primary.liveTrafficAvailable);
+  let trafficSummary = primary.trafficSummary || 'Live traffic unavailable — using estimated travel time.';
+
+  if (
+    (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') &&
+    alternatives.length > 1
+  ) {
+    const fastestAlt = [...alternatives].sort(
+      (a, b) => a.estimatedTimeMin - b.estimatedTimeMin
+    )[0];
+    if (
+      fastestAlt &&
+      fastestAlt.category !== primary.category &&
+      primary.estimatedTimeMin - fastestAlt.estimatedTimeMin >= 1.5
+    ) {
+      trafficSummary = `${trafficSummary} A faster alternative route is available.`;
+    }
+  }
+  return { liveTrafficAvailable, trafficSummary };
+}
+
 export function evaluateExternalRoutes(
   db: Database.Database,
   params: {
@@ -474,6 +656,7 @@ export function evaluateExternalRoutes(
     destinationLng: number;
     destinationLabel?: string;
     destinationNodeId?: string;
+    travelMode?: TravelMode;
     distanceWeight?: number;
     timeWeight?: number;
     congestionWeight?: number;
@@ -481,11 +664,13 @@ export function evaluateExternalRoutes(
     candidates: Array<{
       distanceMeters: number;
       durationSeconds: number;
+      staticDurationSeconds?: number;
       geometry: Array<[number, number]>;
       summary?: string;
       steps?: Array<{
         instruction: string;
         name?: string;
+        maneuver?: string;
         distanceMeters?: number;
         durationSec?: number;
         latitude: number;
@@ -494,6 +679,7 @@ export function evaluateExternalRoutes(
     }>;
   }
 ): RouteAlternativesResultDTO {
+  const travelMode: TravelMode = params.travelMode || 'DRIVE';
   const graph = buildEffectiveGraph(db);
   const customWeights: Partial<MultiFactorWeights> = {};
   if (params.distanceWeight !== undefined) customWeights.distance = params.distanceWeight;
@@ -538,11 +724,13 @@ export function evaluateExternalRoutes(
       {
         distanceMeters: c.distanceMeters,
         durationSeconds: c.durationSeconds,
+        staticDurationSeconds: c.staticDurationSeconds,
         geometry: c.geometry,
         summary: c.summary || `Google Road Route ${idx + 1}`,
         steps: (c.steps || []).map((st) => ({
           instruction: st.instruction,
           name: st.name || 'Route Step',
+          maneuver: st.maneuver,
           distanceMeters: st.distanceMeters || 0,
           durationSec: st.durationSec || 0,
           latitude: st.latitude,
@@ -552,16 +740,25 @@ export function evaluateExternalRoutes(
       graph,
       db,
       weights,
-      idx === 0 ? 'GOOGLE_ROUTES_DRIVING' : 'GOOGLE_ROUTES_ALTERNATIVE'
+      getAlgorithmForMode(travelMode, idx === 0),
+      travelMode
     )
   );
+
+  const ranked = rankEvaluatedAlternatives(evaluated).map((alt) =>
+    attachUnverifiedReportsToAlternative(db, alt)
+  );
+  const { liveTrafficAvailable, trafficSummary } = buildTopLevelTrafficSummary(ranked, travelMode);
+  const lastUpdated = new Date().toISOString();
 
   return {
     origin: originDto,
     destination: destDto,
-    alternatives: rankEvaluatedAlternatives(evaluated).map((alt) =>
-      attachUnverifiedReportsToAlternative(db, alt)
-    ),
+    travelMode,
+    liveTrafficAvailable,
+    trafficSummary,
+    lastUpdated,
+    alternatives: ranked,
     recalculatedDueToNetworkEvent:
       graph.activeClosuresCount > 0 || graph.activeSimulationsCount > 0,
     activeClosuresCount: graph.activeClosuresCount,
@@ -581,12 +778,14 @@ export async function calculateRoutes(
     destinationLat?: number;
     destinationLng?: number;
     destinationLabel?: string;
+    travelMode?: TravelMode;
     distanceWeight?: number;
     timeWeight?: number;
     congestionWeight?: number;
     incidentWeight?: number;
   }
 ): Promise<RouteAlternativesResultDTO> {
+  const travelMode: TravelMode = params.travelMode || 'DRIVE';
   const graph = buildEffectiveGraph(db);
 
   const customWeights: Partial<MultiFactorWeights> = {};
@@ -603,7 +802,7 @@ export async function calculateRoutes(
     params.destinationLat !== undefined &&
     params.destinationLng !== undefined;
 
-  // Path 1: Arbitrary coordinate routing via Google Routes API + TRAFFIX simulated traffic overlay
+  // Path 1: Arbitrary coordinate routing via Google Routes API + TRAFFIX overlay
   if (hasCoords) {
     const oLat = params.originLat!;
     const oLng = params.originLng!;
@@ -643,7 +842,9 @@ export async function calculateRoutes(
 
     const googleRes = await fetchGoogleRoutes(
       { lat: oLat, lng: oLng },
-      { lat: dLat, lng: dLng }
+      { lat: dLat, lng: dLng },
+      [],
+      travelMode
     );
 
     if (googleRes.ok) {
@@ -653,13 +854,15 @@ export async function calculateRoutes(
           graph,
           db,
           weights,
-          idx === 0 ? 'GOOGLE_ROUTES_DRIVING' : 'GOOGLE_ROUTES_ALTERNATIVE'
+          getAlgorithmForMode(travelMode, idx === 0),
+          travelMode
         )
       );
 
-      // If all candidates pass through a locally CLOSED segment and local graph has a bypass, fetch a detour via bypass midpoint
+      // If all motorized candidates pass through a locally CLOSED segment and local graph has a bypass, fetch a detour via bypass midpoint
       const hasOpenCandidate = evaluated.some((e) => !e.intersectsClosedRoad);
       if (
+        (travelMode === 'DRIVE' || travelMode === 'TWO_WHEELER') &&
         !hasOpenCandidate &&
         nearestOrigin &&
         nearestDest &&
@@ -681,7 +884,8 @@ export async function calculateRoutes(
             const detourRes = await fetchGoogleRoutes(
               { lat: oLat, lng: oLng },
               { lat: dLat, lng: dLng },
-              [{ lat: midNode.latitude, lng: midNode.longitude }]
+              [{ lat: midNode.latitude, lng: midNode.longitude }],
+              travelMode
             );
             if (detourRes.ok && detourRes.routes.length > 0) {
               const detourEval = evaluateExternalRouteAgainstGraph(
@@ -689,7 +893,8 @@ export async function calculateRoutes(
                 graph,
                 db,
                 weights,
-                'GOOGLE_ROUTES_ALTERNATIVE'
+                'GOOGLE_ROUTES_ALTERNATIVE',
+                travelMode
               );
               if (!detourEval.intersectsClosedRoad) {
                 evaluated.unshift(detourEval);
@@ -699,21 +904,50 @@ export async function calculateRoutes(
         }
       }
 
+      const ranked = rankEvaluatedAlternatives(evaluated).map((alt) =>
+        attachUnverifiedReportsToAlternative(db, alt)
+      );
+      const { liveTrafficAvailable, trafficSummary } = buildTopLevelTrafficSummary(
+        ranked,
+        travelMode
+      );
+      const lastUpdated = new Date().toISOString();
+
       return {
         origin: originDto,
         destination: destDto,
-        alternatives: rankEvaluatedAlternatives(evaluated).map((alt) =>
-          attachUnverifiedReportsToAlternative(db, alt)
-        ),
+        travelMode,
+        liveTrafficAvailable,
+        trafficSummary,
+        lastUpdated,
+        alternatives: ranked,
         recalculatedDueToNetworkEvent:
           graph.activeClosuresCount > 0 || graph.activeSimulationsCount > 0,
         activeClosuresCount: graph.activeClosuresCount,
         activeSimulationsCount: graph.activeSimulationsCount,
-        provider: getRoutingProviderMetadata('GOOGLE_ROUTES_WITH_SIMULATED_TRAFFIC'),
+        provider: getRoutingProviderMetadata(
+          'GOOGLE_ROUTES_WITH_SIMULATED_TRAFFIC',
+          liveTrafficAvailable
+            ? `Real road geometry & live Google Routes traffic (${travelMode}) combined with TRAFFIX verified & user-reported incident checks.`
+            : `Real ${travelMode.toLowerCase().replace('_', ' ')} route via Google Routes API; live traffic intervals unavailable or not applicable to this mode.`
+        ),
       };
     }
 
-    // Fallback: when server Routes API isn't configured/reachable AND coordinates are within local simulated graph (<= 15 km)
+    // NEVER invent a car route for WALK, BICYCLE, or TRANSIT when unsupported or unavailable
+    if (travelMode === 'WALK' || travelMode === 'BICYCLE' || travelMode === 'TRANSIT') {
+      const modeName =
+        travelMode === 'WALK'
+          ? 'Walking'
+          : travelMode === 'BICYCLE'
+          ? 'Bicycle'
+          : 'Public transport';
+      throw unprocessable(
+        `${modeName} routing is not available for the selected locations (${googleRes.error}). Try Car or Motorcycle instead.`
+      );
+    }
+
+    // Fallback: when server Routes API isn't configured/reachable AND coordinates are within local simulated graph (<= 15 km) for motorized vehicles
     if (
       nearestOrigin &&
       nearestDest &&
@@ -733,6 +967,13 @@ export async function calculateRoutes(
         );
       }
       const hasCleaner = localAlts.some((a) => a.relevantIncidents.length === 0);
+      const enriched = localAlts.map((a) => ({
+        ...enrichLocalAlternative(db, a, graph, hasCleaner),
+        travelMode,
+        liveTrafficAvailable: false,
+        trafficSummary: 'Live traffic unavailable — using estimated TRAFFIX corridor travel time.',
+        betaWarning: getBetaWarning(travelMode),
+      }));
       return {
         origin: {
           ...nearestOrigin.node,
@@ -742,7 +983,11 @@ export async function calculateRoutes(
           ...nearestDest.node,
           label: `${destDto.label} (snapped to ${nearestDest.node.name})`,
         },
-        alternatives: localAlts.map((a) => enrichLocalAlternative(db, a, graph, hasCleaner)),
+        travelMode,
+        liveTrafficAvailable: false,
+        trafficSummary: 'Live traffic unavailable — using estimated TRAFFIX corridor travel time.',
+        lastUpdated: new Date().toISOString(),
+        alternatives: enriched,
         recalculatedDueToNetworkEvent:
           graph.activeClosuresCount > 0 || graph.activeSimulationsCount > 0,
         activeClosuresCount: graph.activeClosuresCount,
@@ -788,7 +1033,16 @@ export async function calculateRoutes(
   return {
     origin,
     destination,
-    alternatives: alternatives.map((a) => enrichLocalAlternative(db, a, graph, hasCleaner)),
+    travelMode,
+    liveTrafficAvailable: false,
+    trafficSummary: 'Live traffic unavailable — using simulated corridor travel time.',
+    lastUpdated: new Date().toISOString(),
+    alternatives: alternatives.map((a) => ({
+      ...enrichLocalAlternative(db, a, graph, hasCleaner),
+      travelMode,
+      liveTrafficAvailable: false,
+      trafficSummary: 'Live traffic unavailable — using simulated corridor travel time.',
+    })),
     recalculatedDueToNetworkEvent:
       graph.activeClosuresCount > 0 || graph.activeSimulationsCount > 0,
     activeClosuresCount: graph.activeClosuresCount,

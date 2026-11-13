@@ -6,18 +6,33 @@ import {
   Map as GoogleMap,
   useMap,
 } from '@vis.gl/react-google-maps';
-import { AlertCircle, Flame, Network, SlidersHorizontal } from 'lucide-react';
+import {
+  AlertCircle,
+  Compass,
+  Flame,
+  LocateFixed,
+  Minus,
+  Network,
+  Plus,
+  SlidersHorizontal,
+  TrafficCone,
+} from 'lucide-react';
 import { useMapsStatus } from '../context/MapsContext';
 import { useTheme } from '../context/ThemeContext';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { listStoredRegions } from '../utils/offlineMapStore';
+import { OfflineTileMap } from './OfflineTileMap';
 import {
   BusStopDTO,
   IncidentDTO,
   JunctionDTO,
   NearbyHospitalDTO,
+  NearbyPlaceDTO,
   ParkingLocationDTO,
   RoadNodeDTO,
   RoadSegmentDTO,
   TrafficPredictionDTO,
+  TrafficSpeedIntervalDTO,
   TransitJourneyLegDTO,
 } from '../shared/types';
 import {
@@ -40,6 +55,8 @@ export interface OverlayRoute {
   dashed?: boolean;
   weight?: number;
   trafficStatus?: string;
+  liveTraffic?: boolean;
+  speedReadingIntervals?: TrafficSpeedIntervalDTO[];
 }
 
 export interface MapEndpointMarker {
@@ -62,9 +79,19 @@ interface TrafficMapProps {
   selectedBusStopId?: string | null;
   hospitals?: NearbyHospitalDTO[];
   selectedHospitalId?: string | null;
+  nearbyPlaces?: NearbyPlaceDTO[];
+  selectedNearbyPlaceId?: string | null;
   transitLegs?: TransitJourneyLegDTO[];
   startPoint?: MapEndpointMarker | null;
   endPoint?: MapEndpointMarker | null;
+  userLocation?: { lat: number; lng: number; heading?: number | null } | null;
+  followUserLocation?: boolean;
+  recenterTrigger?: number;
+  showTrafficLayer?: boolean;
+  onToggleTrafficLayer?: () => void;
+  showNavigationControls?: boolean;
+  onMyLocationClick?: () => void;
+  locatingUser?: boolean;
   selectedPin?: { lat: number; lng: number } | null;
   highlightNodeIds?: string[];
   activeRouteSegmentIds?: string[];
@@ -82,9 +109,13 @@ interface TrafficMapProps {
   onParkingSelect?: (parking: ParkingLocationDTO) => void;
   onBusStopSelect?: (stop: BusStopDTO) => void;
   onHospitalSelect?: (hospital: NearbyHospitalDTO) => void;
+  onNearbyPlaceSelect?: (place: NearbyPlaceDTO) => void;
+  onSetDestinationFromPlace?: (place: NearbyPlaceDTO) => void;
   showHeatmapDefault?: boolean;
   showRoadOverlay?: boolean;
   heightClass?: string;
+  forceOfflineMap?: boolean;
+  onOpenOfflineManager?: () => void;
 }
 
 export function getIncidentMarkerColor(inc: IncidentDTO): string {
@@ -295,7 +326,10 @@ function MapPolylinesManager({
         if (rt.trafficStatus) {
           lines.push({ label: 'Traffic Status', text: rt.trafficStatus });
         }
-        lines.push({ text: 'SIMULATED TRAFFIC DATA', tone: 'cyan' });
+        lines.push({
+          text: rt.liveTraffic ? 'LIVE GOOGLE ROUTES TRAFFIC' : 'ESTIMATED / SIMULATED ROUTE',
+          tone: 'cyan',
+        });
         onOpenPopupRef.current({
           position: pos,
           title: rt.label,
@@ -307,6 +341,35 @@ function MapPolylinesManager({
       });
 
       polylines.push(routeLine);
+
+      // Render traffic-colored intervals on top of the active selected route when Google speedReadingIntervals are available
+      if (!rt.dashed && rt.speedReadingIntervals && rt.speedReadingIntervals.length > 0) {
+        for (const iv of rt.speedReadingIntervals) {
+          if (iv.speed === 'SPEED_UNSPECIFIED') continue;
+          const startIdx = Math.max(0, iv.startPolylinePointIndex);
+          const endIdx = Math.min(path.length - 1, iv.endPolylinePointIndex);
+          if (endIdx <= startIdx) continue;
+          const segPath = path.slice(startIdx, endIdx + 1);
+          if (segPath.length < 2) continue;
+          const intervalColor =
+            iv.speed === 'TRAFFIC_JAM'
+              ? '#EF4444'
+              : iv.speed === 'SLOW'
+              ? '#F97316'
+              : '#22C55E';
+          const segLine = new google.maps.Polyline({
+            map,
+            path: segPath,
+            geodesic: true,
+            strokeColor: intervalColor,
+            strokeWeight: weight,
+            strokeOpacity: 0.98,
+            clickable: false,
+            zIndex: 60 + idx,
+          });
+          polylines.push(segLine);
+        }
+      }
     }
 
     // Transit Journey Legs
@@ -416,6 +479,71 @@ function FitBoundsController({
   return null;
 }
 
+function TrafficLayerController({
+  mapId,
+  visible,
+}: {
+  mapId: string;
+  visible: boolean;
+}) {
+  const map = useMap(mapId);
+
+  useEffect(() => {
+    if (!map || !visible) return;
+    const layer = new google.maps.TrafficLayer();
+    layer.setMap(map);
+    return () => {
+      layer.setMap(null);
+    };
+  }, [map, visible]);
+
+  return null;
+}
+
+function UserFollowController({
+  mapId,
+  userLocation,
+  followUserLocation,
+  recenterTrigger,
+}: {
+  mapId: string;
+  userLocation?: { lat: number; lng: number } | null;
+  followUserLocation?: boolean;
+  recenterTrigger?: number;
+}) {
+  const map = useMap(mapId);
+
+  useEffect(() => {
+    if (!map || !userLocation) return;
+    if (followUserLocation || (recenterTrigger !== undefined && recenterTrigger > 0)) {
+      map.panTo({ lat: userLocation.lat, lng: userLocation.lng });
+      const z = map.getZoom();
+      if (followUserLocation && (z === undefined || z < 16)) {
+        map.setZoom(16);
+      }
+    }
+  }, [map, userLocation?.lat, userLocation?.lng, followUserLocation, recenterTrigger]);
+
+  return null;
+}
+
+function getNearbyPlaceBadge(category: NearbyPlaceDTO['category']) {
+  switch (category) {
+    case 'gas_station':
+      return { glyph: '⛽', bg: '#0284C7', label: 'Petrol / Fuel' };
+    case 'hospital':
+      return { glyph: '+', bg: '#DC2626', label: 'Hospital' };
+    case 'parking':
+      return { glyph: 'P', bg: '#16A34A', label: 'Parking' };
+    case 'restaurant':
+      return { glyph: 'R', bg: '#EA580C', label: 'Restaurant' };
+    case 'bus_station':
+      return { glyph: 'B', bg: '#0EA5E9', label: 'Bus Stop' };
+    case 'atm':
+      return { glyph: '$', bg: '#7C3AED', label: 'ATM' };
+  }
+}
+
 export const TrafficMap: React.FC<TrafficMapProps> = ({
   nodes,
   segments,
@@ -430,9 +558,19 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
   selectedBusStopId = null,
   hospitals = [],
   selectedHospitalId = null,
+  nearbyPlaces = [],
+  selectedNearbyPlaceId = null,
   transitLegs = [],
   startPoint = null,
   endPoint = null,
+  userLocation = null,
+  followUserLocation = false,
+  recenterTrigger,
+  showTrafficLayer = false,
+  onToggleTrafficLayer,
+  showNavigationControls = false,
+  onMyLocationClick,
+  locatingUser = false,
   selectedPin = null,
   highlightNodeIds = [],
   activeRouteSegmentIds = [],
@@ -447,14 +585,29 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
   onParkingSelect,
   onBusStopSelect,
   onHospitalSelect,
+  onNearbyPlaceSelect,
+  onSetDestinationFromPlace,
   showHeatmapDefault = true,
   showRoadOverlay = true,
   heightClass = 'h-[480px]',
+  forceOfflineMap = false,
+  onOpenOfflineManager,
 }) => {
   const mapId = useId();
   const map = useMap(mapId);
   const { hasApiKey, authFailureMessage, loadingStatus } = useMapsStatus();
   const { isDark } = useTheme();
+  const isOnline = useOnlineStatus();
+  const [hasOfflineRegions, setHasOfflineRegions] = useState(false);
+
+  useEffect(() => {
+    const syncRegions = () => {
+      listStoredRegions().then((r) => setHasOfflineRegions(r.length > 0));
+    };
+    syncRegions();
+    window.addEventListener('traffix-offline-updated', syncRegions);
+    return () => window.removeEventListener('traffix-offline-updated', syncRegions);
+  }, []);
 
   const [showGraphLayer, setShowGraphLayer] = useState(showRoadOverlay);
   const [showHeatmap, setShowHeatmap] = useState(showHeatmapDefault);
@@ -463,6 +616,7 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
   const [heatmapAvailable, setHeatmapAvailable] = useState(true);
   const [heatmapUnavailableReason, setHeatmapUnavailableReason] = useState<string | null>(null);
   const [activePopup, setActivePopup] = useState<GraphPopupTarget | null>(null);
+  const [popupNearbyPlace, setPopupNearbyPlace] = useState<NearbyPlaceDTO | null>(null);
 
   const handleHeatmapConfigChange = (
     updater: HeatmapConfig | ((prev: HeatmapConfig) => HeatmapConfig)
@@ -513,10 +667,12 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
     loadingStatus === APILoadingStatus.AUTH_FAILURE ||
     loadingStatus === APILoadingStatus.FAILED;
 
+  const showOfflineTileMap = forceOfflineMap || !isOnline || (mapsUnavailable && hasOfflineRegions);
+
   return (
     <div className="relative rounded-xl border border-slate-200 dark:border-slate-800/80 overflow-hidden bg-white dark:bg-[#0B1220] shadow-sm dark:shadow-none">
       {/* Layer Controls */}
-      {!mapsUnavailable && showRoadOverlay && (
+      {!mapsUnavailable && !showOfflineTileMap && showRoadOverlay && (
         <div className="absolute top-3 right-14 z-[510] flex flex-wrap items-center justify-end gap-2 max-w-[calc(100%-5rem)]">
           <button
             type="button"
@@ -585,7 +741,7 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
         </div>
       )}
 
-      {!mapsUnavailable && showHeatmapSettings && heatmapAvailable && (
+      {!mapsUnavailable && !showOfflineTileMap && showHeatmapSettings && heatmapAvailable && (
         <HeatmapSettingsPanel
           config={heatmapConfig}
           onChange={handleHeatmapConfigChange}
@@ -607,7 +763,34 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
       )}
 
       <div className={`relative w-full ${heightClass}`}>
-        {mapsUnavailable ? (
+        {showOfflineTileMap ? (
+          <OfflineTileMap
+            center={
+              startPoint
+                ? { lat: startPoint.lat, lng: startPoint.lng }
+                : hospitals.length > 0
+                ? { lat: hospitals[0].latitude, lng: hospitals[0].longitude }
+                : { lat: 15.853, lng: 74.502 }
+            }
+            routes={routes}
+            startPoint={startPoint}
+            endPoint={endPoint}
+            userLocation={userLocation}
+            nodes={nodes}
+            segments={segments}
+            incidents={incidents}
+            parkingLocations={parkingLocations}
+            busStops={busStops}
+            pickMode={pickMode}
+            heightClass={heightClass}
+            fitBoundsKey={fitBoundsKey}
+            onMapClick={onMapClick}
+            onMyLocationClick={onMyLocationClick}
+            onOpenOfflineManager={onOpenOfflineManager}
+            onRouteSelect={onRouteSelect}
+            isOfflineNetwork={!isOnline}
+          />
+        ) : mapsUnavailable ? (
           <div className="w-full h-full flex flex-col items-center justify-center p-6 text-center bg-slate-100 dark:bg-[#0B1220]">
             <AlertCircle className="w-8 h-8 text-amber-500 mb-3" />
             <p className="text-sm font-semibold text-slate-900 dark:text-white">
@@ -657,6 +840,15 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
                 hospitals={hospitals}
                 startPoint={startPoint}
                 endPoint={endPoint}
+              />
+
+              <TrafficLayerController mapId={mapId} visible={showTrafficLayer} />
+
+              <UserFollowController
+                mapId={mapId}
+                userLocation={userLocation}
+                followUserLocation={followUserLocation}
+                recenterTrigger={recenterTrigger}
               />
 
               {showRoadOverlay && (
@@ -984,6 +1176,59 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
                 );
               })}
 
+              {/* Nearby Places Markers */}
+              {nearbyPlaces.map((place) => {
+                const badge = getNearbyPlaceBadge(place.category);
+                const isSelected = place.placeId === selectedNearbyPlaceId;
+                return (
+                  <AdvancedMarker
+                    key={`nearby-${place.category}-${place.placeId}`}
+                    position={{ lat: place.latitude, lng: place.longitude }}
+                    title={`${place.name} (${place.distanceMeters} m)`}
+                    zIndex={82}
+                    onClick={() => {
+                      setActivePopup(null);
+                      setPopupNearbyPlace(place);
+                      onNearbyPlaceSelect?.(place);
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: isSelected ? 30 : 25,
+                        height: isSelected ? 30 : 25,
+                        borderRadius: '8px',
+                        backgroundColor: badge.bg,
+                        color: '#FFFFFF',
+                        border: isSelected ? '2.5px solid #FDE047' : '2px solid #FFFFFF',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        fontSize: '12px',
+                        fontWeight: 800,
+                        boxShadow: '0 3px 10px rgba(0,0,0,0.4)',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {badge.glyph}
+                    </div>
+                  </AdvancedMarker>
+                );
+              })}
+
+              {/* Live User GPS Location Dot */}
+              {userLocation && (
+                <AdvancedMarker
+                  position={{ lat: userLocation.lat, lng: userLocation.lng }}
+                  title="Your Current Location"
+                  zIndex={980}
+                >
+                  <div className="relative flex items-center justify-center">
+                    <span className="absolute w-7 h-7 rounded-full bg-blue-500/30 animate-ping" />
+                    <span className="relative w-4 h-4 rounded-full bg-blue-600 border-2 border-white shadow-md" />
+                  </div>
+                </AdvancedMarker>
+              )}
+
               {selectedPin && (
                 <AdvancedMarker
                   position={{ lat: selectedPin.lat, lng: selectedPin.lng }}
@@ -1080,6 +1325,58 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
                 </AdvancedMarker>
               )}
 
+              {popupNearbyPlace && (
+                <InfoWindow
+                  position={{ lat: popupNearbyPlace.latitude, lng: popupNearbyPlace.longitude }}
+                  onCloseClick={() => setPopupNearbyPlace(null)}
+                >
+                  <div className="text-xs space-y-1.5 min-w-[200px] max-w-[260px] text-slate-800 dark:text-slate-100">
+                    <div className="font-semibold text-slate-900 dark:text-white">
+                      {popupNearbyPlace.name}
+                    </div>
+                    <div className="text-[11px] text-slate-600 dark:text-slate-300">
+                      {popupNearbyPlace.address}
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+                      <span className="text-emerald-600 dark:text-emerald-300">
+                        {popupNearbyPlace.distanceMeters >= 1000
+                          ? `${(popupNearbyPlace.distanceMeters / 1000).toFixed(2)} km`
+                          : `${popupNearbyPlace.distanceMeters} m`}
+                      </span>
+                      {popupNearbyPlace.rating !== null && (
+                        <span>★ {popupNearbyPlace.rating}</span>
+                      )}
+                      {popupNearbyPlace.openNow !== null && (
+                        <span
+                          className={
+                            popupNearbyPlace.openNow ? 'text-emerald-600' : 'text-amber-600'
+                          }
+                        >
+                          {popupNearbyPlace.openNow ? 'Open now' : 'Closed'}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[10px] font-mono text-cyan-700 dark:text-cyan-300">
+                      {popupNearbyPlace.source === 'GOOGLE_PLACES_NEW'
+                        ? 'GOOGLE PLACES API (NEW)'
+                        : 'TRAFFIX SAMPLE DATA'}
+                    </div>
+                    {onSetDestinationFromPlace && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSetDestinationFromPlace(popupNearbyPlace);
+                          setPopupNearbyPlace(null);
+                        }}
+                        className="w-full rounded-md bg-blue-600 hover:bg-blue-500 text-white px-2.5 py-1.5 text-[11px] font-semibold transition-colors"
+                      >
+                        Set as Destination
+                      </button>
+                    )}
+                  </div>
+                </InfoWindow>
+              )}
+
               {activePopup && (
                 <InfoWindow
                   position={activePopup.position}
@@ -1126,6 +1423,87 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
               )}
             </GoogleMap>
 
+            {/* Google Maps-Like Quick Navigation Map Controls */}
+            {showNavigationControls && (
+              <div className="absolute bottom-4 right-3 z-[510] flex flex-col gap-1.5">
+                {onToggleTrafficLayer && (
+                  <button
+                    type="button"
+                    onClick={onToggleTrafficLayer}
+                    title={showTrafficLayer ? 'Hide Google Live Traffic Layer' : 'Show Google Live Traffic Layer'}
+                    className={`inline-flex items-center justify-center gap-1.5 rounded-lg border px-2.5 h-9 text-[11px] font-semibold shadow-lg backdrop-blur-sm transition-colors ${
+                      showTrafficLayer
+                        ? 'border-emerald-500 bg-emerald-600 text-white'
+                        : 'border-slate-300 dark:border-slate-700 bg-white/95 dark:bg-[#090E1A]/90 text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
+                    }`}
+                  >
+                    <TrafficCone className="w-3.5 h-3.5" />
+                    <span>Traffic</span>
+                  </button>
+                )}
+
+                {onMyLocationClick && (
+                  <button
+                    type="button"
+                    onClick={onMyLocationClick}
+                    disabled={locatingUser}
+                    title="Center on My GPS Location"
+                    aria-label="My Location"
+                    className="inline-flex items-center justify-center w-9 h-9 self-end rounded-lg border border-slate-300 dark:border-slate-700 bg-white/95 dark:bg-[#090E1A]/90 text-blue-600 dark:text-blue-400 shadow-lg hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    <LocateFixed className={`w-4 h-4 ${locatingUser ? 'animate-pulse' : ''}`} />
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (!map) return;
+                    if (userLocation) {
+                      map.panTo({ lat: userLocation.lat, lng: userLocation.lng });
+                      map.setZoom(16);
+                    } else if (routes.length > 0 && routes[0].geometry.length > 0) {
+                      const b = new google.maps.LatLngBounds();
+                      for (const [lat, lng] of routes[0].geometry) b.extend({ lat, lng });
+                      map.fitBounds(b, 52);
+                    }
+                  }}
+                  title="Recenter Map"
+                  aria-label="Recenter Map"
+                  className="inline-flex items-center justify-center w-9 h-9 self-end rounded-lg border border-slate-300 dark:border-slate-700 bg-white/95 dark:bg-[#090E1A]/90 text-slate-700 dark:text-slate-200 shadow-lg hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  <Compass className="w-4 h-4" />
+                </button>
+
+                <div className="flex flex-col self-end rounded-lg border border-slate-300 dark:border-slate-700 bg-white/95 dark:bg-[#090E1A]/90 shadow-lg overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!map) return;
+                      map.setZoom((map.getZoom() ?? 13) + 1);
+                    }}
+                    title="Zoom In"
+                    aria-label="Zoom In"
+                    className="w-9 h-9 inline-flex items-center justify-center text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 border-b border-slate-200 dark:border-slate-800"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!map) return;
+                      map.setZoom(Math.max(3, (map.getZoom() ?? 13) - 1));
+                    }}
+                    title="Zoom Out"
+                    aria-label="Zoom Out"
+                    className="w-9 h-9 inline-flex items-center justify-center text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                  >
+                    <Minus className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
             {showRoadOverlay && (
               <D3RoadGraphOverlay
                 map={map}
@@ -1150,23 +1528,22 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
       {/* Footer Legend */}
       <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 dark:border-slate-800/80 bg-slate-50 dark:bg-[#0C1322] px-4 py-2.5 text-[11px] text-slate-600 dark:text-slate-300">
         <div className="flex flex-wrap items-center gap-4">
-          {showRoadOverlay && (
+          {(showRoadOverlay || showTrafficLayer || routes.some((r) => (r.speedReadingIntervals?.length || 0) > 0)) && (
             <>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#22C55E]" /> Low traffic
+                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#22C55E]" /> Smooth traffic
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#EAB308]" /> Moderate
+                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#F97316]" /> Moderate
               </span>
               <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#F97316]" /> Heavy
+                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#EF4444]" /> Heavy
               </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#EF4444]" /> Severe
-              </span>
-              <span className="flex items-center gap-1.5">
-                <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#6B7280]" /> Closed
-              </span>
+              {showRoadOverlay && (
+                <span className="flex items-center gap-1.5">
+                  <span className="inline-block w-2.5 h-2.5 rounded-sm bg-[#6B7280]" /> Closed
+                </span>
+              )}
             </>
           )}
           {incidents.length > 0 && (
@@ -1181,6 +1558,11 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
               <span className="inline-block w-2.5 h-2.5 rounded bg-[#22C55E]" /> Parking Open
               <span className="inline-block w-2.5 h-2.5 rounded bg-[#F97316]" /> Limited
               <span className="inline-block w-2.5 h-2.5 rounded bg-[#EF4444]" /> Full
+            </span>
+          )}
+          {nearbyPlaces.length > 0 && (
+            <span className="flex items-center gap-1.5 text-blue-700 dark:text-blue-300">
+              <span>{nearbyPlaces.length} nearby places shown</span>
             </span>
           )}
           {busStops.length > 0 && (
@@ -1204,7 +1586,12 @@ export const TrafficMap: React.FC<TrafficMapProps> = ({
           )}
         </div>
         <span className="font-mono text-cyan-700 dark:text-cyan-400">
-          GOOGLE MAPS · {predictionMode ? 'SIMULATED TRAFFIC · FORECAST' : 'SIMULATED / SAMPLE DATA'}
+          GOOGLE MAPS ·{' '}
+          {predictionMode
+            ? 'SIMULATED TRAFFIC · FORECAST'
+            : routes.some((r) => r.liveTraffic) || showTrafficLayer
+            ? 'LIVE TRAFFIC + TRAFFIX REPORTS'
+            : 'ESTIMATED / SIMULATED OVERLAY'}
         </span>
       </div>
     </div>
