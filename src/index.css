@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-sans: 'DM Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+
+  html.light body {
+    font-family: var(--font-sans);
+    background-color: #F8FAFC;
+    color: #0F172A;
+  }
+
+  html.dark body {
+    font-family: var(--font-sans);
+    background-color: #090E1A;
+    color: #F1F5F9;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+.traffix-endpoint-icon {
+  background: transparent;
+  border: none;
+}
+
+/* Theme-aware styling for Google Maps InfoWindow chrome */
+html.dark .gm-style .gm-style-iw-c {
+  background-color: #0F172A !important;
+  color: #F1F5F9 !important;
+  border: 1px solid rgba(148, 163, 184, 0.28) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45) !important;
+  padding: 10px 12px !important;
+}
+
+html.light .gm-style .gm-style-iw-c {
+  background-color: #FFFFFF !important;
+  color: #0F172A !important;
+  border: 1px solid rgba(203, 213, 225, 0.9) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 12px 28px rgba(15, 23, 42, 0.14) !important;
+  padding: 10px 12px !important;
+}
+
+.gm-style .gm-style-iw-d {
+  overflow: auto !important;
+}
+
+html.dark .gm-style .gm-style-iw-tc::after {
+  background: #0F172A !important;
+}
+
+html.light .gm-style .gm-style-iw-tc::after {
+  background: #FFFFFF !important;
+}
+
+html.dark .gm-style .gm-ui-hover-effect > span {
+  background-color: #CBD5E1 !important;
+}
+
+html.light .gm-style .gm-ui-hover-effect > span {
+  background-color: #334155 !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
